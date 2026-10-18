@@ -38,7 +38,7 @@ def get_message_topic_id(message) -> Optional[int]:
         return message.reply_to.reply_to_msg_id
     return None
 
-async def resolve_peer(client: TelegramClient, peer_str: str):
+async def resolve_peer(client: TelegramClient, peer_str: str, is_destination: bool = False):
     """Resolves chat input (username, ID, or invite link) to a Telethon entity."""
     entity = None
     if peer_str.startswith("-100") or (peer_str.isdigit() or (peer_str.startswith("-") and peer_str[1:].isdigit())):
@@ -64,8 +64,18 @@ async def resolve_peer(client: TelegramClient, peer_str: str):
     if entity is None:
         entity = await client.get_entity(peer_str)
 
-    # Auto-resolve migrated supergroups: if channel only contains a migration action from a legacy chat
-    if isinstance(entity, types.Channel):
+    # If destination is a basic group that migrated to a supergroup, auto-upgrade to the supergroup!
+    if is_destination and isinstance(entity, types.Chat) and getattr(entity, "migrated_to", None):
+        try:
+            mig_input = entity.migrated_to
+            sg_ent = await client.get_entity(mig_input)
+            logger.info(f"Destination basic chat #{entity.id} was upgraded to Supergroup #{sg_ent.id} (forum={getattr(sg_ent, 'forum', False)})! Using supergroup.")
+            return sg_ent
+        except Exception as e:
+            logger.debug(f"Could not auto-upgrade destination chat to supergroup: {e}")
+
+    # For SOURCE channels only: if channel only contains a migration action from a legacy chat
+    if not is_destination and isinstance(entity, types.Channel):
         try:
             first_msgs = await client.get_messages(entity, limit=2)
             if len(first_msgs) == 1 and isinstance(first_msgs[0].action, types.MessageActionChannelMigrateFrom):
@@ -91,6 +101,9 @@ def extract_topic_id_from_updates(result) -> Optional[int]:
 
 async def sync_forum_topics(client: TelegramClient, source_entity, dest_entity, db: Database, progress_cb: Optional[Callable] = None) -> Dict[int, int]:
     """Reads all topics from source forum and creates corresponding topics in destination forum."""
+    if not getattr(dest_entity, "forum", False):
+        logger.info(f"Destination {getattr(dest_entity, 'title', dest_entity)} does not have forum topics enabled. Skipping topic sync.")
+        return {}
     dest_chat_id = utils.get_peer_id(dest_entity) if dest_entity else None
     topic_map = db.get_all_topic_mappings(dest_chat_id)
 
@@ -178,6 +191,8 @@ async def sync_forum_topics(client: TelegramClient, source_entity, dest_entity, 
     return topic_map
 
 async def ensure_topic_for_message(client: TelegramClient, source_entity, dest_entity, db: Database, source_topic_id: int) -> Optional[int]:
+    if not getattr(dest_entity, "forum", False):
+        return None
     dest_chat_id = utils.get_peer_id(dest_entity) if dest_entity else None
     dest_topic_id = db.get_dest_topic_id(source_topic_id, dest_chat_id)
     if dest_topic_id:

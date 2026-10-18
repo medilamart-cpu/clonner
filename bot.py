@@ -1012,8 +1012,8 @@ async def setup_callback_handler(event):
         s_peer = setup["source_peer"]
         d_peer = setup["dest_peer"]
         try:
-            s_entity = await resolve_peer(u_client, s_peer)
-            d_entity = await resolve_peer(u_client, d_peer)
+            s_entity = await resolve_peer(u_client, s_peer, is_destination=False)
+            d_entity = await resolve_peer(u_client, d_peer, is_destination=True)
             u_data["source_peer"] = s_peer
             u_data["source_entity"] = s_entity
             u_data["dest_peer"] = d_peer
@@ -1180,34 +1180,20 @@ async def extract_cmd_handler(event):
     u_data["range_end_id"] = end_id
     u_data["force_reclone"] = False
 
-    # If source & destination entities are already set from previous clone
-    if u_data.get("source_entity") and u_data.get("dest_entity"):
-        s_title = getattr(u_data['source_entity'], 'title', 'Source')
-        d_title = getattr(u_data['dest_entity'], 'title', 'Destination')
-        if start_id is not None:
-            u_data["state"] = STATE_WAITING_RANGE_FORCE
-            return await event.reply(
-                f"🎯 **Target Range Configured**:\n\n"
-                f"• **Source**: `{s_title}`\n"
-                f"• **Destination**: `{d_title}`\n"
-                f"• **Start Message ID**: `#{start_id}`\n"
-                f"• **Target Limit**: `{limit}` messages (IDs `{start_id}` to `#{end_id}`)\n\n"
-                f"How should previous records in database be handled for these messages?\n"
-                f"**1** ➡️ **Skip Duplicates** (Skip messages already cloned)\n"
-                f"**2** ➡️ **Force Re-clone** (Re-clone all {limit} messages)\n\n"
-                f"Reply with `1` or `2`:"
-            )
-        else:
-            u_data["state"] = STATE_WAITING_RANGE
-            return await event.reply(
-                f"🎯 **Extract Selective Messages**\n\n"
-                f"• **Current Source**: `{s_title}`\n"
-                f"• **Current Destination**: `{d_title}`\n\n"
-                f"Enter the starting message ID and the number of messages to extract:\n"
-                f"• Example: `4 100` *(extracts 100 messages starting from message #4)*\n"
-                f"• Or: `4-100` *(extracts messages with IDs from 4 to 100)*\n\n"
-                f"👉 Send your message range:"
-            )
+    # If user has saved setup profiles, allow 1-click selection of which profile to extract from
+    setups = db.get_user_setups(event.sender_id)
+    if setups:
+        buttons = []
+        for s in setups:
+            sid = s["id"]
+            buttons.append([Button.inline(f"🎯 Use #{sid}: {s['setup_name'][:18]}", data=f"setup_run_extract_{sid}".encode())])
+        buttons.append([Button.inline("➕ Enter Other Channels", data=b"extract_custom_channels")])
+        hint = f"\n• Target: `{limit}` messages starting from `#{start_id}`" if start_id else ""
+        return await event.reply(
+            f"🎯 **Select Profile for Message Extraction**:{hint}\n\n"
+            f"Choose which saved channel profile you want to extract messages from:",
+            buttons=buttons
+        )
 
     u_data["state"] = STATE_WAITING_SOURCE
     range_hint = f" *(Target: {limit} messages starting from #{start_id})*" if start_id else ""
@@ -1217,6 +1203,21 @@ async def extract_cmd_handler(event):
         f"• Public @username: `@channel_name`\n"
         f"• Invite link: `https://t.me/+AbCdEf...`\n"
         f"• Chat ID: `-1001234567890`"
+    )
+
+
+@bot.on(events.CallbackQuery(data=b"extract_custom_channels"))
+async def extract_custom_callback(event):
+    await event.delete()
+    u_data = get_user_data(event.sender_id)
+    u_data["state"] = STATE_WAITING_SOURCE
+    await bot.send_message(
+        event.chat_id,
+        "📥 **Step 1/3: Source Chat for Extraction**\n\n"
+        "Please send the **Source Channel or Forum**:\n"
+        "• Public @username: `@channel_name`\n"
+        "• Invite link: `https://t.me/+AbCdEf...`\n"
+        "• Chat ID: `-1001234567890`"
     )
 
 
@@ -1285,16 +1286,18 @@ async def message_dispatcher(event):
 
         msg = await event.reply("⏳ Verifying code...")
         try:
-            await user_client.sign_in(
+            u_client = active_user_clients.get(event.sender_id) or await get_user_client(event.sender_id)
+            await u_client.sign_in(
                 phone=user_data["phone"],
                 code=clean_code,
                 phone_code_hash=user_data["phone_code_hash"]
             )
-            me = await user_client.get_me()
+            me = await u_client.get_me()
             try:
-                session_str = user_client.session.save()
+                session_str = u_client.session.save()
                 if session_str and len(session_str) > 10:
                     db.save_user_session(event.sender_id, session_str, user_data.get("phone"), me.first_name, me.username)
+                    active_user_clients[event.sender_id] = u_client
                     logger.info(f"Session saved to DB for user {event.sender_id}")
                 else:
                     logger.warning(f"Empty session string for user {event.sender_id}")
@@ -1318,11 +1321,13 @@ async def message_dispatcher(event):
         password = text
         msg = await event.reply("⏳ Verifying 2FA password...")
         try:
-            await user_client.sign_in(password=password)
-            me = await user_client.get_me()
+            u_client = active_user_clients.get(event.sender_id) or await get_user_client(event.sender_id)
+            await u_client.sign_in(password=password)
+            me = await u_client.get_me()
             try:
-                session_str = user_client.session.save()
+                session_str = u_client.session.save()
                 db.save_user_session(event.sender_id, session_str, user_data.get("phone"), me.first_name, me.username)
+                active_user_clients[event.sender_id] = u_client
             except Exception as se:
                 logger.error(f"Error saving session string: {se}")
             user_data["state"] = STATE_IDLE
@@ -1339,7 +1344,8 @@ async def message_dispatcher(event):
     elif state == STATE_WAITING_SOURCE:
         msg = await event.reply(f"⏳ Resolving source: `{text}`...")
         try:
-            entity = await resolve_peer(user_client, text)
+            _uc = await get_user_client(event.sender_id)
+            entity = await resolve_peer(_uc, text, is_destination=False)
             if not entity:
                 return await msg.edit("❌ Could not resolve source chat. Please verify username or invite link.")
 
@@ -1359,7 +1365,8 @@ async def message_dispatcher(event):
     elif state == STATE_WAITING_DEST:
         msg = await event.reply(f"⏳ Resolving destination: `{text}`...")
         try:
-            entity = await resolve_peer(user_client, text)
+            _uc = await get_user_client(event.sender_id)
+            entity = await resolve_peer(_uc, text, is_destination=True)
             if not entity:
                 return await msg.edit("❌ Could not resolve destination chat. Please verify username or invite link.")
 
@@ -1376,8 +1383,10 @@ async def message_dispatcher(event):
             title = getattr(entity, "title", getattr(entity, "first_name", text))
 
             warning = ""
-            if not getattr(entity, "forum", False):
-                warning = "\n⚠️ *Note: Destination group does not currently have 'Topics' enabled. All messages will be placed in the main chat unless you toggle Topics ON in group settings.*"
+            if isinstance(entity, types.Chat):
+                warning = "\n\n⚠️ **WARNING**: Destination is a **Basic Telegram Group**, NOT a Forum! Basic groups DO NOT support topics — all messages will be placed in the main chat. To use topics, please upgrade the group to a Supergroup and toggle 'Topics' ON in group settings."
+            elif not getattr(entity, "forum", False):
+                warning = "\n\n⚠️ **Note**: Destination group does not currently have **'Topics'** enabled. All messages will be placed in General unless you toggle Topics ON in group settings."
 
             if user_data.get("range_start_id") is not None:
                 start_id = user_data["range_start_id"]
@@ -1614,7 +1623,8 @@ async def message_dispatcher(event):
     elif state == STATE_WAITING_SYNC_SOURCE:
         msg = await event.reply(f"⏳ Resolving source: `{text}`...")
         try:
-            entity = await resolve_peer(user_client, text)
+            _uc = await get_user_client(event.sender_id)
+            entity = await resolve_peer(_uc, text, is_destination=False)
             if not entity:
                 return await msg.edit("❌ Could not resolve source chat. Please verify ID or link.")
             user_data["sync_source_peer"] = text
@@ -1672,7 +1682,8 @@ async def message_dispatcher(event):
     elif state == STATE_WAITING_SYNC_DEST:
         msg = await event.reply(f"⏳ Resolving destination: `{text}`...")
         try:
-            entity = await resolve_peer(user_client, text)
+            _uc = await get_user_client(event.sender_id)
+            entity = await resolve_peer(_uc, text, is_destination=True)
             if not entity:
                 return await msg.edit("❌ Could not resolve destination chat. Please verify ID or link.")
             user_data["sync_dest_peer"] = text
@@ -2003,6 +2014,58 @@ async def run_cloner_worker(
             current_grouped_id = None
             current_topic_id = None
 
+            # Topic cache for destination forums
+            dest_topics_cache: Dict[str, int] = {}
+            if getattr(dest_entity, "forum", False):
+                try:
+                    offset_id = 0
+                    offset_topic = 0
+                    while True:
+                        res = await user_client(GetForumTopicsRequest(
+                            peer=dest_entity,
+                            offset_date=None,
+                            offset_id=offset_id,
+                            offset_topic=offset_topic,
+                            limit=100
+                        ))
+                        for t in getattr(res, "topics", []):
+                            if isinstance(t, types.ForumTopic):
+                                dest_topics_cache[t.title.strip().lower()] = t.id
+                        if len(getattr(res, "topics", [])) < 100:
+                            break
+                        last_topic = res.topics[-1]
+                        offset_topic = last_topic.id
+                        offset_id = getattr(last_topic, "top_message", 0)
+                except Exception as e:
+                    logger.warning(f"Could not load destination topics cache: {e}")
+
+            current_subject_name: Optional[str] = None
+            current_subject_topic_id: Optional[int] = None
+
+            async def get_or_create_subject_topic(subj_name: str) -> Optional[int]:
+                if not getattr(dest_entity, "forum", False):
+                    return None
+                s_lower = subj_name.strip().lower()
+                if s_lower in dest_topics_cache:
+                    return dest_topics_cache[s_lower]
+                for attempt in range(2):
+                    try:
+                        res = await user_client(CreateForumTopicRequest(
+                            peer=dest_entity,
+                            title=subj_name,
+                            random_id=random.randint(1, 2**63 - 1)
+                        ))
+                        t_id = extract_topic_id_from_updates(res)
+                        if t_id:
+                            dest_topics_cache[s_lower] = t_id
+                            return t_id
+                    except errors.FloodWaitError as fwe:
+                        await asyncio.sleep(fwe.seconds + 2)
+                    except Exception as ex:
+                        logger.error(f"Failed to create forum topic for '{subj_name}': {ex}")
+                        break
+                return None
+
             async def flush_album():
                 nonlocal album_buffer, current_grouped_id, current_topic_id, cloned_count
                 if not album_buffer:
@@ -2010,6 +2073,8 @@ async def run_cloner_worker(
                 dest_topic = None
                 if current_topic_id:
                     dest_topic = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, current_topic_id)
+                elif current_subject_topic_id is not None:
+                    dest_topic = current_subject_topic_id
 
                 while True:
                     try:
@@ -2017,7 +2082,7 @@ async def run_cloner_worker(
                         custom_caption = db.apply_caption_rules(first_text) if first_text else None
                         await send_album_fast(user_client, album_buffer, dest_entity, dest_topic, custom_caption=custom_caption)
                         for m in album_buffer:
-                            db.record_cloned_message(m.id, None, current_topic_id, source_chat_id)
+                            db.record_cloned_message(m.id, None, current_topic_id or current_subject_topic_id, source_chat_id)
                         cloned_count += len(album_buffer)
                         user_data["stats"]["cloned"] = cloned_count
                         await asyncio.sleep(DELAY_BETWEEN_MESSAGES)
@@ -2031,6 +2096,27 @@ async def run_cloner_worker(
                 current_grouped_id = None
                 current_topic_id = None
 
+            is_range_job = (start_id is not None or limit is not None or end_id is not None)
+
+            # Validate range bounds if specified
+            if is_range_job and start_id is not None and start_id > 0:
+                try:
+                    highest_res = await user_client.get_messages(source_entity, limit=1)
+                    if highest_res:
+                        highest_id = highest_res[0].id
+                        if start_id > highest_id:
+                            await safe_edit_status(
+                                status_msg,
+                                f"❌ **Invalid Message Range**\n\n"
+                                f"• Source chat (`{source_title}`) only has messages up to `#{highest_id}`.\n"
+                                f"• Requested start ID `#{start_id}` does not exist!\n\n"
+                                f"👉 Please check the message ID and send `/extract` again."
+                            )
+                            user_data["is_running"] = False
+                            return
+                except Exception as ex:
+                    logger.warning(f"Could not check highest msg ID: {ex}")
+
             iter_kwargs = {"reverse": True}
             if start_id is not None and start_id > 0:
                 iter_kwargs["min_id"] = start_id - 1
@@ -2039,7 +2125,6 @@ async def run_cloner_worker(
             if limit is not None and limit > 0:
                 iter_kwargs["limit"] = limit
 
-            is_range_job = (start_id is not None or limit is not None or end_id is not None)
             total_target_str = f"/{limit}" if limit else ""
 
             async for msg in user_client.iter_messages(source_entity, **iter_kwargs):
@@ -2048,6 +2133,18 @@ async def run_cloner_worker(
 
                 if msg.action:
                     skipped_count += 1
+                    continue
+
+                # Auto-detect subject delimiter headers when destination is a forum
+                detected_subj = detect_subject_header(msg)
+                if detected_subj and getattr(dest_entity, "forum", False):
+                    if album_buffer:
+                        await flush_album()
+                    current_subject_name = detected_subj
+                    current_subject_topic_id = await get_or_create_subject_topic(current_subject_name)
+                    user_data["stats"]["current_topic"] = current_subject_name
+                    db.record_cloned_message(msg.id, None, current_subject_topic_id, source_chat_id)
+                    logger.info(f"📚 Subject Delimiter Detected: #{msg.id} -> '{current_subject_name}' (Topic ID: {current_subject_topic_id})")
                     continue
 
                 if not force_reclone and db.is_message_cloned(msg.id, source_chat_id):
@@ -2074,12 +2171,15 @@ async def run_cloner_worker(
                     if album_buffer:
                         await flush_album()
 
-                # Single message
+                # Single message topic resolution
                 source_topic_id = get_message_topic_id(msg)
                 dest_topic_id = None
                 if source_topic_id:
                     dest_topic_id = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, source_topic_id)
                     user_data["stats"]["current_topic"] = f"Topic {source_topic_id}"
+                elif current_subject_topic_id is not None:
+                    dest_topic_id = current_subject_topic_id
+                    user_data["stats"]["current_topic"] = current_subject_name
 
                 async def speed_status_updater(progress_str):
                     try:
@@ -2109,7 +2209,7 @@ async def run_cloner_worker(
                             status_updater=speed_status_updater,
                             custom_caption=custom_caption
                         )
-                        db.record_cloned_message(msg.id, dest_msg_id, source_topic_id, source_chat_id)
+                        db.record_cloned_message(msg.id, dest_msg_id, source_topic_id or current_subject_topic_id, source_chat_id)
                         cloned_count += 1
                         user_data["stats"]["cloned"] = cloned_count
                         user_data["stats"]["skipped"] = skipped_count
@@ -2150,17 +2250,35 @@ async def run_cloner_worker(
             if album_buffer:
                 await flush_album()
 
-            finish_title = "✅ **Selective Message Extraction Complete!**" if is_range_job else "✅ **History Clone Complete!**"
-            range_line = f"• **Requested Range**: Starting from `#{start_id or 1}` (Target: {limit or 'all'})\n" if is_range_job else ""
-            await safe_edit_status(
-                status_msg,
-                f"{finish_title}\n\n"
-                f"{range_line}"
-                f"• **Total Cloned**: `{cloned_count}` messages\n"
-                f"• **Skipped**: `{skipped_count}`\n"
-                f"• **Source**: `{source_title}`\n"
-                f"• **Destination**: `{dest_title}`"
-            )
+            finish_title = "🎯 **Selective Message Extraction Complete!**" if is_range_job else "✅ **History Clone Complete!**"
+            range_line = f"• **Requested Range**: `#{start_id or 1}` to `#{end_id or 'end'}` ({limit or 'all'} messages)\n" if is_range_job else ""
+            
+            if is_range_job and cloned_count == 0:
+                if skipped_count > 0:
+                    summary_msg = (
+                        f"ℹ️ **Extraction Result: 0 Messages Cloned**\n\n"
+                        f"{range_line}"
+                        f"All `{skipped_count}` messages in this range were **already cloned** previously in the database.\n\n"
+                        f"👉 To re-clone them, run `/extract` and choose option **2 (Force Re-clone)**."
+                    )
+                else:
+                    summary_msg = (
+                        f"⚠️ **Extraction Result: 0 Messages Found**\n\n"
+                        f"{range_line}"
+                        f"No messages found in range `#{start_id}` to `#{end_id}` in `{source_title}`.\n\n"
+                        f"👉 Please verify the message IDs in the source channel."
+                    )
+                await safe_edit_status(status_msg, summary_msg)
+            else:
+                await safe_edit_status(
+                    status_msg,
+                    f"{finish_title}\n\n"
+                    f"{range_line}"
+                    f"• **Successfully Cloned**: `{cloned_count}` messages\n"
+                    f"• **Skipped (Duplicates/Actions)**: `{skipped_count}`\n"
+                    f"• **Source**: `{source_title}`\n"
+                    f"• **Destination**: `{dest_title}`"
+                )
 
         # Step 3: Live Forwarder
         if live_forward and user_data.get("is_running", False):
