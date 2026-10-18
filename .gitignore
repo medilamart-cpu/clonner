@@ -1,0 +1,27 @@
+# Environment & Secrets
+config.env
+*.env
+*.pem
+
+# Telegram Session Files (CRITICAL: Do not commit)
+*.session
+*.session-journal
+*.session.dead
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary downloads & logs
+temp_downloads/
+*.log
+
+# Virtual environments
+venv/
+.venv/
