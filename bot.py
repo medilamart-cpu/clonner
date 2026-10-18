@@ -1047,8 +1047,9 @@ async def setup_callback_handler(event):
                     f"⚙️ **Select Cloning Mode for '{setup['setup_name']}'**:\n\n"
                     f"**1** ➡️ **Clone History + Live Mirror**\n"
                     f"**2** ➡️ **Clone History Only**\n"
-                    f"**3** ➡️ **Live Mirror Only**\n\n"
-                    f"Reply with `1`, `2`, or `3`:"
+                    f"**3** ➡️ **Live Mirror Only**\n"
+                    f"**5** ➡️ **Subject-Header Forum Clone** 📚 *(Auto-sorts lectures into subject topics)*\n\n"
+                    f"Reply with `1`, `2`, `3`, or `5`:"
                 )
 
         elif mode == "extract":

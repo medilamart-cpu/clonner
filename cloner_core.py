@@ -40,25 +40,43 @@ def get_message_topic_id(message) -> Optional[int]:
 
 async def resolve_peer(client: TelegramClient, peer_str: str):
     """Resolves chat input (username, ID, or invite link) to a Telethon entity."""
-    peer_str = str(peer_str).strip()
+    entity = None
     if peer_str.startswith("-100") or (peer_str.isdigit() or (peer_str.startswith("-") and peer_str[1:].isdigit())):
         try:
-            return await client.get_entity(int(peer_str))
+            entity = await client.get_entity(int(peer_str))
         except Exception:
             pass
 
-    if "t.me/+" in peer_str or "joinchat" in peer_str:
-        hash_part = peer_str.split("+")[-1] if "t.me/+" in peer_str else peer_str.split("/")[-1]
-        try:
-            from telethon.tl.functions.messages import ImportChatInviteRequest
-            res = await client(ImportChatInviteRequest(hash=hash_part))
-            return res.chats[0]
-        except errors.UserAlreadyParticipantError:
-            from telethon.tl.functions.messages import CheckChatInviteRequest
-            res = await client(CheckChatInviteRequest(hash=hash_part))
-            return getattr(res, "chat", None)
+    if entity is None:
+        if "t.me/+" in peer_str or "joinchat" in peer_str:
+            hash_part = peer_str.split("+")[-1] if "t.me/+" in peer_str else peer_str.split("/")[-1]
+            try:
+                from telethon.tl.functions.messages import ImportChatInviteRequest
+                res = await client(ImportChatInviteRequest(hash=hash_part))
+                entity = res.chats[0]
+            except errors.UserAlreadyParticipantError:
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                res = await client(CheckChatInviteRequest(hash=hash_part))
+                entity = getattr(res, "chat", None)
+            except Exception:
+                pass
 
-    return await client.get_entity(peer_str)
+    if entity is None:
+        entity = await client.get_entity(peer_str)
+
+    # Auto-resolve migrated supergroups: if channel only contains a migration action from a legacy chat
+    if isinstance(entity, types.Channel):
+        try:
+            first_msgs = await client.get_messages(entity, limit=2)
+            if len(first_msgs) == 1 and isinstance(first_msgs[0].action, types.MessageActionChannelMigrateFrom):
+                legacy_id = -first_msgs[0].action.chat_id
+                logger.info(f"Detected migrated supergroup {getattr(entity, 'id', None)}! Automatically redirecting to legacy chat: {legacy_id}")
+                return await client.get_entity(legacy_id)
+        except Exception as e:
+            logger.debug(f"Migrated check exception: {e}")
+
+    return entity
+
 
 def extract_topic_id_from_updates(result) -> Optional[int]:
     if hasattr(result, "updates"):
