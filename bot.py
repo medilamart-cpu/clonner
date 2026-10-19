@@ -22,6 +22,8 @@ from telethon.tl import types
 from database import Database
 from cloner_core import (
     resolve_peer,
+    resolve_peer_and_topic,
+    parse_peer_and_topic,
     get_message_topic_id,
     sync_forum_topics,
     ensure_topic_for_message,
@@ -1012,16 +1014,20 @@ async def setup_callback_handler(event):
         s_peer = setup["source_peer"]
         d_peer = setup["dest_peer"]
         try:
-            s_entity = await resolve_peer(u_client, s_peer, is_destination=False)
-            d_entity = await resolve_peer(u_client, d_peer, is_destination=True)
+            s_entity, s_topic = await resolve_peer_and_topic(u_client, s_peer, is_destination=False)
+            d_entity, d_topic = await resolve_peer_and_topic(u_client, d_peer, is_destination=True)
             u_data["source_peer"] = s_peer
             u_data["source_entity"] = s_entity
+            u_data["source_topic_id"] = s_topic
             u_data["dest_peer"] = d_peer
             u_data["dest_entity"] = d_entity
+            u_data["dest_topic_id"] = d_topic
             u_data["sync_source_peer"] = s_peer
             u_data["sync_source_entity"] = s_entity
+            u_data["sync_source_topic_id"] = s_topic
             u_data["sync_dest_peer"] = d_peer
             u_data["sync_dest_entity"] = d_entity
+            u_data["sync_dest_topic_id"] = d_topic
         except Exception as e:
             return await event.answer(f"❌ Failed to resolve channels: {e}", alert=True)
 
@@ -1345,18 +1351,20 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving source: `{text}`...")
         try:
             _uc = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uc, text, is_destination=False)
+            entity, source_topic_id = await resolve_peer_and_topic(_uc, text, is_destination=False)
             if not entity:
                 return await msg.edit("❌ Could not resolve source chat. Please verify username or invite link.")
 
             user_data["source_peer"] = text
             user_data["source_entity"] = entity
+            user_data["source_topic_id"] = source_topic_id
             user_data["state"] = STATE_WAITING_DEST
             title = getattr(entity, "title", getattr(entity, "first_name", text))
+            topic_filter_msg = f"\n📌 **Target Topic**: `#{source_topic_id}` *(Only messages from this topic will be cloned)*\n" if source_topic_id else ""
             await msg.edit(
-                f"✅ **Source Selected**: `{title}`\n\n"
-                f"📤 **Step 2/3: Destination Forum Group**\n\n"
-                f"Please send the **Destination Forum Group** (@username, invite link, or ID):"
+                f"✅ **Source Selected**: `{title}`{topic_filter_msg}\n\n"
+                f"📤 **Step 2/3: Destination Channel or Forum Group**\n\n"
+                f"Please send the **Destination Forum Group** (@username, invite link, ID, or specific Topic Link):"
             )
         except Exception as e:
             await msg.edit(f"❌ Error resolving source: {e}\nPlease check and send again.")
@@ -1366,12 +1374,13 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving destination: `{text}`...")
         try:
             _uc = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uc, text, is_destination=True)
+            entity, dest_topic_id = await resolve_peer_and_topic(_uc, text, is_destination=True)
             if not entity:
                 return await msg.edit("❌ Could not resolve destination chat. Please verify username or invite link.")
 
             user_data["dest_peer"] = text
             user_data["dest_entity"] = entity
+            user_data["dest_topic_id"] = dest_topic_id
             try:
                 s_peer = str(user_data.get("source_peer", ""))
                 d_peer = str(text)
@@ -1381,6 +1390,7 @@ async def message_dispatcher(event):
             except Exception as e:
                 logger.error(f"Failed to auto-save user setup: {e}")
             title = getattr(entity, "title", getattr(entity, "first_name", text))
+            dest_topic_msg = f"\n📌 **Target Destination Topic**: `#{dest_topic_id}` *(All cloned messages will be sent into this topic)*\n" if dest_topic_id else ""
 
             warning = ""
             if isinstance(entity, types.Chat):
@@ -1624,15 +1634,17 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving source: `{text}`...")
         try:
             _uc = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uc, text, is_destination=False)
+            entity, sync_s_topic = await resolve_peer_and_topic(_uc, text, is_destination=False)
             if not entity:
                 return await msg.edit("❌ Could not resolve source chat. Please verify ID or link.")
             user_data["sync_source_peer"] = text
             user_data["sync_source_entity"] = entity
+            user_data["sync_source_topic_id"] = sync_s_topic
             user_data["state"] = STATE_WAITING_SYNC_SOURCE_RANGE
             title = getattr(entity, "title", getattr(entity, "first_name", text))
+            topic_hint = f"\n📌 **Sync Topic Filter**: Only videos in Topic `#{sync_s_topic}`\n" if sync_s_topic else ""
             await msg.edit(
-                f"✅ **Source Chat Set**: `{title}`\n\n"
+                f"✅ **Source Chat Set**: `{title}`{topic_hint}\n\n"
                 f"👉 **Step 2/4**: Enter the **Source Message Range**:\n"
                 f"• Example: `1-100` *(messages #1 to #100)*\n"
                 f"• Or: `4 100` *(100 messages starting from #4)*"
@@ -1673,8 +1685,9 @@ async def message_dispatcher(event):
         user_data["state"] = STATE_WAITING_SYNC_DEST
         await event.reply(
             f"✅ **Source Range Set**: `#{s_start}` to `#{s_end}`\n\n"
-            f"👉 **Step 3/4**: Please send the **Destination Channel ID or Link** (where the videos are currently sitting without captions):\n"
+            f"👉 **Step 3/4**: Please send the **Destination Channel ID, Link, or Topic Link** (where the videos are currently sitting without captions):\n"
             f"• Private Channel ID: `-1009876543210`\n"
+            f"• Topic Link: `https://t.me/c/9876543210/45`\n"
             f"• Invite Link: `https://t.me/+yyyyyy`"
         )
 
@@ -1683,15 +1696,17 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving destination: `{text}`...")
         try:
             _uc = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uc, text, is_destination=True)
+            entity, sync_d_topic = await resolve_peer_and_topic(_uc, text, is_destination=True)
             if not entity:
                 return await msg.edit("❌ Could not resolve destination chat. Please verify ID or link.")
             user_data["sync_dest_peer"] = text
             user_data["sync_dest_entity"] = entity
+            user_data["sync_dest_topic_id"] = sync_d_topic
             user_data["state"] = STATE_WAITING_SYNC_DEST_RANGE
             title = getattr(entity, "title", getattr(entity, "first_name", text))
+            d_topic_hint = f"\n📌 **Destination Topic**: `#{sync_d_topic}`\n" if sync_d_topic else ""
             await msg.edit(
-                f"✅ **Destination Chat Set**: `{title}`\n\n"
+                f"✅ **Destination Chat Set**: `{title}`{d_topic_hint}\n\n"
                 f"👉 **Step 4/4**: Enter the **Destination Message Range**:\n"
                 f"• Example: `5-105` *(videos sitting at IDs #5 to #105)*\n"
                 f"• Or: `1-100`"
@@ -1754,17 +1769,19 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving source: `{text}`...")
         try:
             _uclient = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uclient, text)
+            entity, s_topic = await resolve_peer_and_topic(_uclient, text, is_destination=False)
             if not entity:
                 return await msg.edit("❌ Could not resolve source chat. Please verify username or invite link.")
             user_data["new_setup_source_peer"] = text
             user_data["new_setup_source_entity"] = entity
+            user_data["new_setup_source_topic_id"] = s_topic
             user_data["state"] = STATE_WAITING_SETUP_DEST
             title = getattr(entity, "title", getattr(entity, "first_name", text))
+            topic_str = f" [Topic #{s_topic}]" if s_topic else ""
             await msg.edit(
-                f"✅ **Source Channel**: `{title}`\n\n"
+                f"✅ **Source Channel**: `{title}`{topic_str}\n\n"
                 f"📤 **Step 3/3: Destination Channel or Forum Group**\n"
-                f"Please send the **Destination Channel or Forum Group** (@username, invite link, or ID):"
+                f"Please send the **Destination Channel, Forum Group, or specific Topic Link** (@username, invite link, ID, or topic link):"
             )
         except Exception as e:
             logger.error(f"Setup source resolve error: {e}")
@@ -1775,13 +1792,15 @@ async def message_dispatcher(event):
         msg = await event.reply(f"⏳ Resolving destination: `{text}`...")
         try:
             _uclient = await get_user_client(event.sender_id)
-            entity = await resolve_peer(_uclient, text)
+            entity, d_topic = await resolve_peer_and_topic(_uclient, text, is_destination=True)
             if not entity:
                 return await msg.edit("❌ Could not resolve destination chat. Please verify username or invite link.")
             s_peer = user_data.get("new_setup_source_peer", "")
             d_peer = text
             s_title = getattr(user_data.get("new_setup_source_entity"), "title", s_peer)
             d_title = getattr(entity, "title", getattr(entity, "first_name", text))
+            if d_topic:
+                d_title = f"{d_title} [Topic #{d_topic}]"
             name = user_data.get("new_setup_name", "Profile")
 
             sid = db.add_user_setup(event.sender_id, name, s_peer, d_peer, s_title, d_title)
@@ -1809,6 +1828,8 @@ async def run_caption_sync_worker(user_id: int, status_msg):
     s_end = user_data["sync_source_end"]
     d_start = user_data["sync_dest_start"]
     d_end = user_data["sync_dest_end"]
+    sync_s_topic = user_data.get("sync_source_topic_id")
+    sync_d_topic = user_data.get("sync_dest_topic_id")
 
     try:
         await status_msg.edit(f"⏳ **Scanning Source Messages (`#{s_start}` to `#{s_end}`)...**\nIndexing video captions...")
@@ -1819,6 +1840,10 @@ async def run_caption_sync_worker(user_id: int, status_msg):
         async for m in user_client.iter_messages(s_entity, min_id=s_min, max_id=s_max, reverse=True):
             if m.id < s_start or m.id > s_end:
                 continue
+            if sync_s_topic is not None:
+                m_top = get_message_topic_id(m)
+                if m_top != sync_s_topic and m.id != sync_s_topic:
+                    continue
             if m.media:
                 size = getattr(m.file, "size", None)
                 duration = None
@@ -1847,6 +1872,10 @@ async def run_caption_sync_worker(user_id: int, status_msg):
         async for m in user_client.iter_messages(d_entity, min_id=d_min, max_id=d_max, reverse=True):
             if m.id < d_start or m.id > d_end:
                 continue
+            if sync_d_topic is not None:
+                m_top = get_message_topic_id(m)
+                if m_top != sync_d_topic and m.id != sync_d_topic:
+                    continue
             if m.media:
                 size = getattr(m.file, "size", None)
                 duration = None
@@ -1966,15 +1995,23 @@ async def run_cloner_worker(
     dest_title = getattr(dest_entity, "title", "Destination")
     source_chat_id = utils.get_peer_id(source_entity) if source_entity else None
 
+    target_source_topic = user_data.get("source_topic_id")
+    target_dest_topic = user_data.get("dest_topic_id")
+
     try:
         # Step 1: Sync Topics
-        await safe_edit_status(status_msg, f"🔄 **Synchronizing Topics...**\n`{source_title}` ➡️ `{dest_title}`")
-        
-        async def topic_progress(text_update):
-            await safe_edit_status(status_msg, f"🔄 **Syncing Topics**:\n{text_update}")
-
-        await sync_forum_topics(user_client, source_entity, dest_entity, db, topic_progress)
-        await safe_edit_status(status_msg, "✅ **Topics Synchronized!** Preparing message clone...")
+        if target_dest_topic is not None:
+            await safe_edit_status(status_msg, f"🎯 **Direct Topic Routing Active**\nAll messages will be directed to Destination Topic `#{target_dest_topic}`.")
+        elif target_source_topic is not None:
+            await safe_edit_status(status_msg, f"🎯 **Single Topic Filter Active**\nOnly cloning Source Topic `#{target_source_topic}`.")
+            if getattr(dest_entity, "forum", False):
+                await ensure_topic_for_message(user_client, source_entity, dest_entity, db, target_source_topic)
+        else:
+            await safe_edit_status(status_msg, f"🔄 **Synchronizing Topics...**\n`{source_title}` ➡️ `{dest_title}`")
+            async def topic_progress(text_update):
+                await safe_edit_status(status_msg, f"🔄 **Syncing Topics**:\n{text_update}")
+            await sync_forum_topics(user_client, source_entity, dest_entity, db, topic_progress)
+            await safe_edit_status(status_msg, "✅ **Topics Synchronized!** Preparing message clone...")
 
         # Step 2: Clone History
         if clone_history:
@@ -2071,7 +2108,9 @@ async def run_cloner_worker(
                 if not album_buffer:
                     return
                 dest_topic = None
-                if current_topic_id:
+                if target_dest_topic is not None:
+                    dest_topic = target_dest_topic
+                elif current_topic_id:
                     dest_topic = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, current_topic_id)
                 elif current_subject_topic_id is not None:
                     dest_topic = current_subject_topic_id
@@ -2135,6 +2174,13 @@ async def run_cloner_worker(
                     skipped_count += 1
                     continue
 
+                # Filter by source topic if specified
+                if target_source_topic is not None:
+                    m_top = get_message_topic_id(msg)
+                    if m_top != target_source_topic and msg.id != target_source_topic:
+                        skipped_count += 1
+                        continue
+
                 # Auto-detect subject delimiter headers when destination is a forum
                 detected_subj = detect_subject_header(msg)
                 if detected_subj and getattr(dest_entity, "forum", False):
@@ -2174,7 +2220,10 @@ async def run_cloner_worker(
                 # Single message topic resolution
                 source_topic_id = get_message_topic_id(msg)
                 dest_topic_id = None
-                if source_topic_id:
+                if target_dest_topic is not None:
+                    dest_topic_id = target_dest_topic
+                    user_data["stats"]["current_topic"] = f"Topic {target_dest_topic}"
+                elif source_topic_id:
                     dest_topic_id = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, source_topic_id)
                     user_data["stats"]["current_topic"] = f"Topic {source_topic_id}"
                 elif current_subject_topic_id is not None:
@@ -2303,9 +2352,14 @@ async def run_cloner_worker(
                 if msg.action or db.is_message_cloned(msg.id, source_chat_id):
                     return
                 s_topic = get_message_topic_id(msg)
-                d_topic = None
-                if s_topic:
-                    d_topic = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, s_topic)
+                if target_source_topic is not None and s_topic != target_source_topic and msg.id != target_source_topic:
+                    return
+                d_topic = target_dest_topic
+                if d_topic is None:
+                    if s_topic:
+                        d_topic = await ensure_topic_for_message(user_client, source_entity, dest_entity, db, s_topic)
+                    elif current_subject_topic_id is not None:
+                        d_topic = current_subject_topic_id
                 try:
                     custom_caption = db.apply_caption_rules(msg.text)
                     dest_msg_id = await send_single_message_fast(
@@ -2315,7 +2369,7 @@ async def run_cloner_worker(
                         d_topic,
                         custom_caption=custom_caption
                     )
-                    db.record_cloned_message(msg.id, dest_msg_id, s_topic, source_chat_id)
+                    db.record_cloned_message(msg.id, dest_msg_id, s_topic or target_source_topic, source_chat_id)
                     logger.info(f"[Live] Forwarded #{msg.id} -> topic {d_topic}")
                 except Exception as ex:
                     logger.error(f"[Live] Error: {ex}")

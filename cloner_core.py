@@ -3,7 +3,8 @@ import asyncio
 import logging
 import random
 import shutil
-from typing import Optional, List, Dict, Callable
+import re
+from typing import Optional, List, Dict, Callable, Tuple, Any
 from telethon import TelegramClient, events, errors, utils
 from telethon.tl import types, functions
 from telethon.tl.functions.messages import (
@@ -38,8 +39,55 @@ def get_message_topic_id(message) -> Optional[int]:
         return message.reply_to.reply_to_msg_id
     return None
 
+def parse_peer_and_topic(raw_input: str) -> Tuple[str, Optional[int]]:
+    """
+    Parses chat strings, URLs, and commands that may include a forum topic ID.
+    Supports:
+    - https://t.me/c/1234567890/25 -> ('-1001234567890', 25)
+    - https://t.me/c/1234567890/25/104 -> ('-1001234567890', 25)
+    - https://t.me/c/1234567890 -> ('-1001234567890', None)
+    - https://t.me/username/25 -> ('username', 25)
+    - https://t.me/username/25/104 -> ('username', 25)
+    - -1001234567890/25 or -1001234567890 25 -> ('-1001234567890', 25)
+    """
+    raw_input = (raw_input or "").strip()
+    
+    # Check t.me/c/1234567890/...
+    m_c = re.search(r"t\.me/c/(\d+)(?:/(\d+))?(?:/(\d+))?", raw_input)
+    if m_c:
+        cid = int(m_c.group(1))
+        peer = f"-100{cid}"
+        num1 = int(m_c.group(2)) if m_c.group(2) else None
+        num2 = int(m_c.group(3)) if m_c.group(3) else None
+        if num2:
+            return peer, num1
+        elif num1:
+            return peer, num1
+        return peer, None
+
+    # Check raw -100xxxx/topic or -100xxxx topic
+    m_raw = re.match(r"^(-?100\d+|-\d+|\d+)\s*[/:\s]\s*(\d+)$", raw_input)
+    if m_raw:
+        return m_raw.group(1), int(m_raw.group(2))
+
+    # Check t.me/username/...
+    m_u = re.search(r"t\.me/([a-zA-Z0-9_]+)(?:/(\d+))?(?:/(\d+))?", raw_input)
+    if m_u and m_u.group(1) not in ("c", "joinchat"):
+        username = m_u.group(1)
+        num1 = int(m_u.group(2)) if m_u.group(2) else None
+        num2 = int(m_u.group(3)) if m_u.group(3) else None
+        if num2:
+            return username, num1
+        elif num1:
+            return username, num1
+        return username, None
+
+    return raw_input, None
+
 async def resolve_peer(client: TelegramClient, peer_str: str, is_destination: bool = False):
     """Resolves chat input (username, ID, or invite link) to a Telethon entity."""
+    clean_peer, _ = parse_peer_and_topic(peer_str)
+    peer_str = clean_peer
     entity = None
     if peer_str.startswith("-100") or (peer_str.isdigit() or (peer_str.startswith("-") and peer_str[1:].isdigit())):
         try:
@@ -86,6 +134,33 @@ async def resolve_peer(client: TelegramClient, peer_str: str, is_destination: bo
             logger.debug(f"Migrated check exception: {e}")
 
     return entity
+
+
+async def resolve_peer_and_topic(client: TelegramClient, input_str: str, is_destination: bool = False) -> Tuple[Any, Optional[int]]:
+    """Resolves chat input (link, ID, username) and extracts any associated forum topic ID."""
+    clean_peer, topic_id = parse_peer_and_topic(input_str)
+    entity = await resolve_peer(client, clean_peer, is_destination=is_destination)
+    if entity and not getattr(entity, "forum", False):
+        # Non-forum channels cannot have topic targets
+        topic_id = None
+    return entity, topic_id
+
+
+async def get_topic_title(client: TelegramClient, entity, topic_id: int) -> str:
+    """Attempts to retrieve the human-readable title of a forum topic."""
+    if not topic_id:
+        return ""
+    try:
+        res = await client(functions.channels.GetMessagesRequest(
+            channel=entity,
+            id=[topic_id]
+        ))
+        if res.messages and hasattr(res.messages[0], "action") and isinstance(res.messages[0].action, types.MessageActionTopicCreate):
+            return res.messages[0].action.title
+    except Exception:
+        pass
+    return f"Topic #{topic_id}"
+
 
 
 def extract_topic_id_from_updates(result) -> Optional[int]:
